@@ -9,9 +9,14 @@
 import numpy as np
 import pytest
 import torch
+from types import SimpleNamespace
+from torch.func import functional_call
 from cudaq import spin
 import cudaq
+from cudaq_solvers.gqe_algorithm.factory import Factory
 from cudaq_solvers.gqe_algorithm.gqe import get_default_config
+from cudaq_solvers.gqe_algorithm.loss import GRPOLoss
+from cudaq_solvers.gqe_algorithm.pipeline import Pipeline
 from cudaq_solvers.gqe_algorithm.scheduler import DefaultScheduler, CosineScheduler, VarBasedScheduler
 from cudaq_solvers.gqe_algorithm.utils import get_gqe_pauli_pool
 import cudaq_solvers as solvers
@@ -146,6 +151,160 @@ def test_variance_scheduler():
         scheduler3.update(energies=low_var_energies)
     final_temp = scheduler3.current_temperature
     assert final_temp >= 0.01  # Should not go below min_temp (0.01)
+
+
+class _ToyPolicy(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(3, 3)
+        self.dropout = torch.nn.Dropout(p=0.5)
+        self.register_buffer("logit_bias", torch.tensor([0.0, 0.1, 0.2]))
+        with torch.no_grad():
+            self.embedding.weight.copy_(torch.eye(3))
+
+    def forward(self, idx):
+        logits = self.dropout(self.embedding(idx)) + self.logit_bias
+        return SimpleNamespace(logits=logits)
+
+
+def _make_test_pipeline():
+    cfg = get_default_config()
+    cfg.num_samples = 2
+    cfg.ngates = 2
+    cfg.buffer_size = 4
+    cfg.warmup_size = 2
+    cfg.batch_size = 2
+    cfg.step_per_epoch = 2
+    return Pipeline(cfg, None, [], _ToyPolicy(), Factory())
+
+
+def test_reference_policy_is_frozen_and_refreshed_each_epoch(monkeypatch):
+    pipeline = _make_test_pipeline()
+    state_seen_during_rollout = []
+    state_dict_keys = set(pipeline.state_dict())
+    rollout_beta = pipeline.scheduler.get_inverse_temperature()
+
+    def record_rollout():
+        state_seen_during_rollout.append({
+            name: tensor.detach().clone()
+            for name, tensor in pipeline._reference_state.items()
+        })
+        pipeline.scheduler.update()
+
+    monkeypatch.setattr(pipeline, "collect_rollout", record_rollout)
+
+    with torch.no_grad():
+        pipeline.model.embedding.weight.add_(1.0)
+    pipeline.train()
+    pipeline.on_train_epoch_start()
+
+    current_parameter = next(pipeline.model.parameters())
+    reference_parameter = pipeline._reference_state["embedding.weight"]
+    reference_buffer = pipeline._reference_state["logit_bias"]
+    torch.testing.assert_close(reference_parameter, current_parameter)
+    torch.testing.assert_close(reference_buffer, pipeline.model.logit_bias)
+    assert reference_parameter.data_ptr() != current_parameter.data_ptr()
+    assert reference_buffer.data_ptr() != pipeline.model.logit_bias.data_ptr()
+    assert not reference_parameter.requires_grad
+    torch.testing.assert_close(state_seen_during_rollout[0]["embedding.weight"],
+                               current_parameter)
+    assert pipeline._reference_inverse_temperature == rollout_beta
+    assert pipeline.scheduler.get_inverse_temperature() != rollout_beta
+    assert set(pipeline.state_dict()) == state_dict_keys
+
+    frozen_parameter = reference_parameter.detach().clone()
+    frozen_buffer = reference_buffer.detach().clone()
+    with torch.no_grad():
+        current_parameter.add_(1.0)
+        pipeline.model.logit_bias.add_(1.0)
+    torch.testing.assert_close(reference_parameter, frozen_parameter)
+    torch.testing.assert_close(reference_buffer, frozen_buffer)
+
+    reference_idx = torch.tensor([[0, 1, 2], [0, 2, 1]])
+    first_reference = pipeline._get_reference_log_probs(reference_idx)
+    second_reference = pipeline._get_reference_log_probs(reference_idx)
+    torch.testing.assert_close(first_reference, second_reference)
+    assert pipeline.model.training
+
+    next_rollout_beta = pipeline.scheduler.get_inverse_temperature()
+    pipeline.on_train_epoch_start()
+    torch.testing.assert_close(pipeline._reference_state["embedding.weight"],
+                               current_parameter)
+    torch.testing.assert_close(pipeline._reference_state["logit_bias"],
+                               pipeline.model.logit_bias)
+    assert pipeline._reference_inverse_temperature == next_rollout_beta
+
+
+def test_old_log_probs_are_recomputed_for_each_batch(monkeypatch):
+    pipeline = _make_test_pipeline()
+    monkeypatch.setattr(pipeline, "collect_rollout", pipeline.scheduler.update)
+    monkeypatch.setattr(pipeline, "log_dict", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "log", lambda *args, **kwargs: None)
+    pipeline.on_train_epoch_start()
+    reference_beta = pipeline._reference_inverse_temperature
+    assert pipeline.scheduler.get_inverse_temperature() != reference_beta
+
+    with torch.no_grad():
+        pipeline.model.embedding.weight.add_(0.5)
+
+    first_idx = torch.tensor([[0, 1, 2], [0, 2, 1]])
+    second_idx = torch.tensor([[0, 0, 1], [0, 1, 0]])
+    first_batch = {"idx": first_idx, "energy": torch.tensor([0.0, 1.0])}
+    second_batch = {"idx": second_idx, "energy": torch.tensor([2.0, 4.0])}
+
+    seen_old_log_probs = []
+    seen_old_log_probs_requires_grad = []
+    seen_inverse_temperatures = []
+    original_compute = pipeline.loss.compute
+
+    def record_compute(*args, **kwargs):
+        seen_old_log_probs_requires_grad.append(
+            kwargs["old_log_probs"].requires_grad)
+        seen_old_log_probs.append(kwargs["old_log_probs"].detach().clone())
+        seen_inverse_temperatures.append(kwargs["inverse_temperature"])
+        return original_compute(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline.loss, "compute", record_compute)
+    pipeline.training_step(first_batch, 0)
+    pipeline.training_step(second_batch, 1)
+
+    expected = []
+    was_training = pipeline.model.training
+    pipeline.model.eval()
+    with torch.no_grad():
+        for idx in (first_idx, second_idx):
+            reference_logits = functional_call(pipeline.model,
+                                               pipeline._reference_state,
+                                               (idx,)).logits
+            expected.append(
+                pipeline.loss.log_prob(idx[:, 1:], reference_logits,
+                                       reference_beta))
+    pipeline.model.train(was_training)
+
+    torch.testing.assert_close(seen_old_log_probs[0], expected[0])
+    torch.testing.assert_close(seen_old_log_probs[1], expected[1])
+    assert not torch.equal(expected[0], expected[1])
+    assert seen_old_log_probs_requires_grad == [False, False]
+    assert seen_inverse_temperatures == [reference_beta, reference_beta]
+
+
+def test_grpo_ratio_at_unity_keeps_policy_gradient():
+    loss_fn = GRPOLoss()
+    gate_logits = torch.tensor([[[0.2, -0.1]], [[-0.3, 0.4]]],
+                               requires_grad=True)
+    gate_indices = torch.tensor([[0], [1]])
+    energies = torch.tensor([0.0, 1.0])
+    old_log_probs = loss_fn.log_prob(gate_indices, gate_logits, 1.0).detach()
+
+    loss = loss_fn.compute(energies,
+                           gate_logits,
+                           gate_indices, {},
+                           inverse_temperature=1.0,
+                           old_log_probs=old_log_probs)
+    loss.backward()
+
+    assert gate_logits.grad[1].abs().sum() > 0
 
 
 @requires_cuda_kernels

@@ -100,8 +100,6 @@ class GRPOLoss(Loss):
     def __init__(self, clip_ratio: float = 0.2):
         super().__init__()
         self.clip_ratio = clip_ratio
-        self.old_log_probs = None
-        self.advantages = None
 
     def compute(self,
                 energies,
@@ -112,27 +110,33 @@ class GRPOLoss(Loss):
         current_log_probs = self.log_prob(gate_indices, gate_logits,
                                           kwargs["inverse_temperature"])
 
-        # nagative log likelihood loss
+        # Negative log likelihood loss for the best sequence in the batch.
         win_id = torch.argmin(energies)
         log_prob_sum_win = torch.mean(current_log_probs[win_id])
         loss = -log_prob_sum_win
 
-        # If all the generated circuits are identical, we use the inverse log
-        # probability as the loss.
-        if torch.std(energies) == 0:
+        # If all generated circuits have the same energy, use only the negative
+        # log likelihood term because the normalized advantage is undefined.
+        # A one-element batch also has an undefined sample standard deviation.
+        if energies.numel() < 2 or torch.std(energies) == 0:
             return loss
 
-        # use the log probability from the first epoch as the reference.
-        if kwargs["current_step"] == 0:
-            self.old_log_probs = current_log_probs.detach()
-            self.advantages = self.calc_advantage(energies)
-            clipped_ratio = 1
-        else:
-            ratio = torch.exp(current_log_probs - self.old_log_probs)
-            clipped_ratio = torch.clamp(ratio, 1. - self.clip_ratio,
-                                        1. + self.clip_ratio)
+        old_log_probs = kwargs.get("old_log_probs")
+        if old_log_probs is None:
+            # Preserve standalone callers of the previous API. Pipeline passes
+            # an explicit epoch reference for the clipped-policy objective.
+            old_log_probs = current_log_probs.detach()
+        if old_log_probs.shape != current_log_probs.shape:
+            raise ValueError(
+                "Reference and current log probabilities must have the same shape."
+            )
 
-        loss -= (clipped_ratio * self.advantages.unsqueeze(1)).mean()
+        advantages = self.calc_advantage(energies)
+        ratio = torch.exp(current_log_probs - old_log_probs.detach())
+        clipped_ratio = torch.clamp(ratio, 1. - self.clip_ratio,
+                                    1. + self.clip_ratio)
+
+        loss -= (clipped_ratio * advantages.unsqueeze(1)).mean()
         return loss
 
     def calc_advantage(self, energies):

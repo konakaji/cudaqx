@@ -6,6 +6,8 @@
 # the terms of the Apache License 2.0 which accompanies this distribution.     #
 # ============================================================================ #
 
+from itertools import chain
+
 import torch
 import cudaq
 import lightning as L
@@ -13,8 +15,10 @@ from mpi4py import MPI
 from torch.nn import functional as F
 from lightning import LightningModule
 from .data import ReplayBuffer, BufferDataset
+from .loss import GRPOLoss
 from torch.utils.data import DataLoader
 from torch.distributions import Categorical
+from torch.func import functional_call
 
 
 class Pipeline(LightningModule):
@@ -45,6 +49,8 @@ class Pipeline(LightningModule):
         self.benchmark_energy = cfg.benchmark_energy
         self._cost = cost
         self.loss = self.factory.create_loss_fn(cfg).to(self.device)
+        self._reference_state = None
+        self._reference_inverse_temperature = None
         self.scheduler = self.factory.create_temperature_scheduler(self.cfg)
         self.ngates = cfg.ngates
         self.num_samples = cfg.num_samples
@@ -74,7 +80,40 @@ class Pipeline(LightningModule):
         super().on_fit_start()
 
     def on_train_epoch_start(self):
+        self._snapshot_reference_policy()
         self.collect_rollout()
+
+    def _snapshot_reference_policy(self):
+        """Save the parameters, buffers, and temperature used for rollout."""
+        if not isinstance(self.loss, GRPOLoss):
+            return
+        self._reference_state = {
+            name: tensor.detach().clone() for name, tensor in chain(
+                self.model.named_parameters(), self.model.named_buffers())
+        }
+        self._reference_inverse_temperature = self.scheduler.get_inverse_temperature(
+        )
+
+    def _get_reference_log_probs(self, idx):
+        """Evaluate the epoch's reference policy on the current batch."""
+        if self._reference_state is None:
+            raise RuntimeError("Reference policy has not been initialized.")
+        with torch.no_grad():
+            reference_logits = self._forward_grpo_policy(
+                idx, self._reference_state).logits
+            return self.loss.log_prob(idx[:, 1:], reference_logits,
+                                      self._reference_inverse_temperature)
+
+    def _forward_grpo_policy(self, idx, reference_state=None):
+        """Run a deterministic GRPO policy forward and restore model mode."""
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            if reference_state is None:
+                return self.model(idx)
+            return functional_call(self.model, reference_state, (idx,))
+        finally:
+            self.model.train(was_training)
 
     def collect_rollout(self):
         idx_output = self.generate()
@@ -164,14 +203,22 @@ class Pipeline(LightningModule):
         energies = batch["energy"].to(self.device)
 
         log_values = {}
-        logits = self.model(idx).logits
-        loss = self.loss.compute(
-            energies,
-            logits,
-            idx[:, 1:],
-            log_values,
-            inverse_temperature=self.scheduler.get_inverse_temperature(),
-            current_step=batch_idx)
+        if isinstance(self.loss, GRPOLoss):
+            logits = self._forward_grpo_policy(idx).logits
+        else:
+            logits = self.model(idx).logits
+        inverse_temperature = self.scheduler.get_inverse_temperature()
+        loss_kwargs = {"inverse_temperature": inverse_temperature}
+        if isinstance(self.loss, GRPOLoss):
+            inverse_temperature = self._reference_inverse_temperature
+            loss_kwargs["inverse_temperature"] = inverse_temperature
+            loss_kwargs["old_log_probs"] = self._get_reference_log_probs(idx)
+        loss = self.loss.compute(energies,
+                                 logits,
+                                 idx[:, 1:],
+                                 log_values,
+                                 current_step=batch_idx,
+                                 **loss_kwargs)
 
         # Log metrics
         self.log_dict(log_values, prog_bar=False, on_step=False, on_epoch=True)
@@ -187,7 +234,7 @@ class Pipeline(LightningModule):
                  on_epoch=True,
                  on_step=False)
         self.log("inverse_temperature",
-                 self.scheduler.get_inverse_temperature(),
+                 inverse_temperature,
                  prog_bar=True,
                  on_epoch=True,
                  on_step=False)
@@ -215,7 +262,10 @@ class Pipeline(LightningModule):
         current_temp = self.scheduler.get_inverse_temperature()
         for _ in range(ngates):
             idx_cond = idx
-            logits_base = self.model(idx_cond)
+            if isinstance(self.loss, GRPOLoss):
+                logits_base = self._forward_grpo_policy(idx_cond)
+            else:
+                logits_base = self.model(idx_cond)
             logits = logits_base.logits[:, -1, :]
             probs = Categorical(logits=-current_temp * logits)
             idx_next = probs.sample()
